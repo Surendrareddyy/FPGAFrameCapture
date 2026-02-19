@@ -1,0 +1,108 @@
+import asyncio
+import socket
+import numpy as np
+import os
+
+ETH_P_ALL = 3
+INTERFACE = "enp0s8"
+FPGA_SRC_DEST = b"\x08\x00\x27\xfb\xdd\x66\xe8\x6a\x64\xe7\xe8\x30"
+
+PACKET_SIZE = 2048
+NUM_PACKETS = 1000
+WORDS_PER_PACKET = 128
+WORD_SIZE = 4  # 32-bit
+
+OUTPUT_FILE = "test.bin"
+
+
+class FPGACapture:
+    def __init__(self):
+        self.loop = asyncio.get_event_loop()
+
+        self.sock = socket.socket(
+            socket.AF_PACKET,
+            socket.SOCK_RAW,
+            socket.htons(ETH_P_ALL),
+        )
+        self.sock.bind((INTERFACE, 0))
+        self.sock.setblocking(False)
+
+        # Preallocate packet buffer (zero-copy target)
+        self.rx_buffer = bytearray(PACKET_SIZE)
+        self.rx_view = memoryview(self.rx_buffer)
+
+        # Preallocate large data buffer
+        self.total_words = NUM_PACKETS * WORDS_PER_PACKET
+        self.data_buffer = np.empty(self.total_words, dtype=">i4")
+        self.write_index = 0
+        self.packet_count = 0
+
+    def start(self):
+        print("Starting zero-copy capture...")
+        self.loop.add_reader(self.sock.fileno(), self.read_packet)
+
+    def stop(self):
+        print("Capture complete.")
+        self.loop.remove_reader(self.sock.fileno())
+        self.sock.close()
+        self.loop.stop()
+
+    def read_packet(self):
+        nbytes = self.sock.recv_into(self.rx_buffer)
+
+        # Fast header check without slicing copy
+        if self.rx_view[0:12] != FPGA_SRC_DEST:
+            return
+
+        payload = self.rx_view[14:nbytes]  # strip Ethernet header
+
+        # Zero-copy numpy view of payload
+        words = np.frombuffer(payload, dtype=">i4", count=WORDS_PER_PACKET)
+
+        end_index = self.write_index + WORDS_PER_PACKET
+        self.data_buffer[self.write_index:end_index] = words
+
+        self.write_index = end_index
+        self.packet_count += 1
+
+        if self.packet_count >= NUM_PACKETS:
+            self.stop()
+
+
+def analyze_data(data):
+    print("Analyzing data...")
+
+    a_diff = np.diff(data)
+
+    if np.all(a_diff == 1):
+        print("All values strictly increasing by 1 ✔")
+        return
+
+    print("ERROR! Discontinuities detected.")
+
+    discontinuities = np.where(a_diff > 1)[0]
+
+    packet_offsets = (discontinuities + 1) % WORDS_PER_PACKET
+    packet_numbers = (discontinuities + 1) // WORDS_PER_PACKET
+
+    print("Packets with discontinuities:", packet_numbers)
+    print("Locations inside packet:", packet_offsets)
+
+    if np.all(packet_offsets == 0):
+        print("All discontinuities at packet boundaries ✔")
+    else:
+        print("ERROR! Mid-packet discontinuities detected ❌")
+
+
+def main():
+    loop = asyncio.get_event_loop()
+    capture = FPGACapture()
+
+    capture.start()
+    loop.run_forever()
+
+    analyze_data(capture.data_buffer)
+
+
+if __name__ == "__main__":
+    main()
